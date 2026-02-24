@@ -7,10 +7,8 @@
  *
  * The events table expects: actor (JSON), data (JSON), meta (JSON)
  *
- * Actor is the raw request.cf object spread with ip/ua from headers, plus
- * authenticated identity from the id-org-ai header. All cf fields (geo,
- * network, botManagement, TLS, colo, etc.) are preserved as-is for
- * ClickHouse JSON column queries.
+ * Actor = clean identity (ip, ua, authenticated user).
+ * Raw cf object goes in meta.cf for edge context queries.
  */
 
 const ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
@@ -50,8 +48,10 @@ export interface CdcEventOptions {
   entityType: string
   /** Entity data (the actual fields — name, email, etc.) */
   entityData: Record<string, unknown>
-  /** Actor identity — full object with id, name, email, orgId, ip, asn, etc. */
+  /** Actor identity (ip, ua, authenticated user) */
   actor?: CdcActor
+  /** Raw cf object from request edge context */
+  cf?: Record<string, unknown>
   /** Source identifier (defaults to "platform") */
   source?: string
   /** URL context */
@@ -61,14 +61,11 @@ export interface CdcEventOptions {
 }
 
 /**
- * Build actor from a Request — spreads raw request.cf for full edge context.
- *
- * All CF fields (geo, network, botManagement, TLS, colo, etc.) are preserved
- * as-is in the raw cf object. Identity from the `id-org-ai` header is merged in.
+ * Build actor from a Request — clean identity only (ip, ua, authenticated user).
+ * Use `cfFromRequest()` to get the raw cf object for meta/data.
  */
 export function actorFromRequest(request: Request): CdcActor {
   const actor: CdcActor = {
-    ...((request.cf ?? {}) as Record<string, unknown>),
     ip: request.headers.get('cf-connecting-ip') ?? undefined,
     ua: request.headers.get('user-agent') ?? undefined,
   }
@@ -93,6 +90,11 @@ export function actorFromRequest(request: Request): CdcActor {
   return actor
 }
 
+/** Raw cf object from request — for storing in data.cf or meta.cf */
+export function cfFromRequest(request: Request): Record<string, unknown> {
+  return (request.cf ?? {}) as Record<string, unknown>
+}
+
 export function buildCdcEvent(opts: CdcEventOptions): Record<string, unknown> {
   return {
     id: ulid(),
@@ -107,6 +109,7 @@ export function buildCdcEvent(opts: CdcEventOptions): Record<string, unknown> {
     data: {
       type: opts.entityType,
       id: opts.id,
+      cf: opts.cf,
       ...opts.entityData,
     },
     meta: opts.meta ?? {},

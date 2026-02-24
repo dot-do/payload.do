@@ -7,7 +7,7 @@
  * - Default fetch handler (health check)
  */
 
-import { buildCdcEvent, actorFromRequest } from '../utilities/cdc.js'
+import { buildCdcEvent, actorFromRequest, cfFromRequest } from '../utilities/cdc.js'
 
 export { PayloadDatabaseDO } from './do.js'
 export { PayloadDatabaseRPC } from './rpc.js'
@@ -87,7 +87,7 @@ export default {
         source: 'diagnostic',
         url: 'https://headless.ly/~test',
         actor: actorFromRequest(request),
-        data: { type: 'TestEntity', id: `test_obj_${Date.now()}`, name: 'Alice', email: 'alice@test.com', nested: { key: 'value' } },
+        data: { type: 'TestEntity', id: `test_obj_${Date.now()}`, name: 'Alice', email: 'alice@test.com', nested: { key: 'value' }, cf: cfFromRequest(request) },
         meta: {},
       }
 
@@ -194,6 +194,7 @@ export default {
             entityData: { name: `${batchId}-${i}`, batch: batchId, i },
             source: 'diagnostic',
             actor: actorFromRequest(request),
+            cf: cfFromRequest(request),
           })
 
           // Dual-write in parallel
@@ -314,6 +315,7 @@ export default {
           entityData: testData,
           source: 'diagnostic',
           actor: actorFromRequest(request),
+          cf: cfFromRequest(request),
         })
 
         const promises: Array<{ path: string; ok: boolean; ms: number; error?: string }> = []
