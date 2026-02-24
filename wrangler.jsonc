@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dotdo-payload",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2025-08-15",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "PAYLOAD_DO", "class_name": "PayloadDatabaseDO" }
+    ]
+  },
+  "pipelines": [
+    { "binding": "EVENTS_PIPELINE", "pipeline": "d8f32274e86b42f68624144111579a26" }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["PayloadDatabaseDO"] }
+  ]
+}

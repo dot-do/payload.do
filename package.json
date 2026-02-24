@@ -1,0 +1,63 @@
+{
+  "name": "@dotdo/payload",
+  "version": "0.1.0",
+  "description": "Payload CMS database adapter for .do (DatabaseDO entities table + CDC)",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    },
+    "./worker": {
+      "workerd": "./src/worker/index.ts",
+      "worker": "./src/worker/index.ts",
+      "import": "./src/worker/index.ts",
+      "types": "./src/worker/index.ts"
+    },
+    "./collections": {
+      "import": "./src/collections/index.ts",
+      "types": "./src/collections/index.ts"
+    },
+    "./types": {
+      "import": "./src/types.ts",
+      "types": "./src/types.ts"
+    },
+    "./schema-hash": {
+      "import": "./src/utilities/schema-hash.ts",
+      "types": "./src/utilities/schema-hash.ts"
+    }
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "test:int": "vitest run --config vitest.integration.config.ts",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "@dotdo/db": "workspace:*",
+    "sqids": "^0.3.0"
+  },
+  "peerDependencies": {
+    "payload": "^3.76.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.12.13",
+    "@cloudflare/workers-types": "^4.20260205.0",
+    "payload": "3.77.0",
+    "typescript": "^5.7.2",
+    "vitest": "~3.2.4",
+    "wrangler": "^4.62.0"
+  },
+  "keywords": [
+    "payload",
+    "database-adapter",
+    "durable-objects",
+    "dotdo"
+  ],
+  "license": "MIT"
+}
