@@ -16,6 +16,7 @@ export const create: Create = async function create(this: DoPayloadAdapter, { co
     try {
       await this._service.sendEvent(this.namespace, {
         id: eventId,
+        ray: '',
         ns: this.context,
         ts,
         type: entityData.type ?? 'custom',
