@@ -3,7 +3,7 @@ import type { DoPayloadAdapter } from '../types.js'
 import { entityToDocument, slugToType } from '../utilities/transforms.js'
 import { resolveNounContext } from '../utilities/noun-cache.js'
 import { translateWhere } from '../queries/where.js'
-import { CH_COLLECTIONS, chFindOne } from './analytics.js'
+import { CH_COLLECTIONS, chFindOne, VERSIONS_COLLECTIONS, versionFindOne } from './analytics.js'
 import { THINGS_COLLECTION, thingsFindOne } from './things.js'
 
 export const findOne: FindOne = async function findOne(this: DoPayloadAdapter, args) {
@@ -11,6 +11,11 @@ export const findOne: FindOne = async function findOne(this: DoPayloadAdapter, a
 
   if (CH_COLLECTIONS.has(collection)) {
     return chFindOne(this._service, collection, this.context, where) as any
+  }
+
+  const versionConfig = VERSIONS_COLLECTIONS.get(collection)
+  if (versionConfig) {
+    return versionFindOne(this._service, versionConfig, where) as any
   }
 
   // Things = universal view (no type filter)

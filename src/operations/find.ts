@@ -5,7 +5,7 @@ import { entityToDocument, slugToType } from '../utilities/transforms.js'
 import { resolveNounContext } from '../utilities/noun-cache.js'
 import { translateWhere } from '../queries/where.js'
 import { translateSort } from '../queries/sort.js'
-import { CH_COLLECTIONS, chFind } from './analytics.js'
+import { CH_COLLECTIONS, chFind, VERSIONS_COLLECTIONS, versionFind } from './analytics.js'
 import { THINGS_COLLECTION, thingsFind } from './things.js'
 
 export const find: Find = async function find(this: DoPayloadAdapter, args) {
@@ -13,6 +13,12 @@ export const find: Find = async function find(this: DoPayloadAdapter, args) {
 
   if (CH_COLLECTIONS.has(collection)) {
     const { docs, totalDocs } = await chFind(this._service, collection, this.context, { where, sort: sort as string | undefined, limit: rawLimit, page, pagination })
+    return { docs, ...buildPagination(totalDocs, rawLimit, page) } as PaginatedDocs<any>
+  }
+
+  const versionConfig = VERSIONS_COLLECTIONS.get(collection)
+  if (versionConfig) {
+    const { docs, totalDocs } = await versionFind(this._service, versionConfig, { where, sort: sort as string | undefined, limit: rawLimit, page, pagination })
     return { docs, ...buildPagination(totalDocs, rawLimit, page) } as PaginatedDocs<any>
   }
 

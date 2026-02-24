@@ -40,7 +40,9 @@
   },
   "dependencies": {
     "@dotdo/db": "workspace:*",
-    "sqids": "^0.3.0"
+    "isbot": "^5.1.35",
+    "sqids": "^0.3.0",
+    "ua-parser-js": "^2.0.9"
   },
   "peerDependencies": {
     "payload": "^3.76.0"

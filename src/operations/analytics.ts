@@ -299,6 +299,21 @@ function buildCHFieldConditions(
 /** Lightweight columns for list views — avoids reading heavy JSON blobs. */
 const CH_LIST_COLUMNS = 'id, ray, ns, ts, type, event, source, url, file, ingested'
 
+/**
+ * Default time window (24h) applied when no explicit ts/createdAt filter is present.
+ * Prevents OOM on ClickHouse Cloud when the events table has 100M+ rows in a single partition.
+ */
+const DEFAULT_TIME_WINDOW = 'ts > now() - INTERVAL 24 HOUR'
+
+/** Check if a Payload where clause contains a time-based filter (ts or createdAt). */
+function hasTimeFilter(where: Where | undefined): boolean {
+  if (!where) return false
+  if (where.ts || where.createdAt || where.timestamp) return true
+  if (where.and && Array.isArray(where.and)) return where.and.some((w) => hasTimeFilter(w as Where))
+  if (where.or && Array.isArray(where.or)) return where.or.some((w) => hasTimeFilter(w as Where))
+  return false
+}
+
 export async function chFind(
   service: PayloadDatabaseService,
   collection: string,
@@ -310,7 +325,11 @@ export async function chFind(
     const { where, sort, limit: rawLimit = 10, page = 1, pagination = true } = args
     // All event collections are platform-wide; skip ns tenant filter
     const skipNs = true
-    const baseFilter = CH_COLLECTION_FILTERS[collection]
+    let baseFilter = CH_COLLECTION_FILTERS[collection]
+    // Apply default time window to prevent OOM on large tables when no explicit time filter
+    if (!hasTimeFilter(where)) {
+      baseFilter = baseFilter ? `${baseFilter} AND ${DEFAULT_TIME_WINDOW}` : DEFAULT_TIME_WINDOW
+    }
     const { sql: whereSql, params } = buildCHWhere(where, context, skipNs, baseFilter)
     const limit = pagination ? rawLimit : 0
 
@@ -346,7 +365,10 @@ export async function chFindOne(service: PayloadDatabaseService, collection: str
   try {
     const table = 'events'
     const skipNs = true
-    const baseFilter = CH_COLLECTION_FILTERS[collection]
+    let baseFilter = CH_COLLECTION_FILTERS[collection]
+    if (!hasTimeFilter(where)) {
+      baseFilter = baseFilter ? `${baseFilter} AND ${DEFAULT_TIME_WINDOW}` : DEFAULT_TIME_WINDOW
+    }
     const { sql: whereSql, params } = buildCHWhere(where, context, skipNs, baseFilter)
 
     const result = await service.chQuery(`SELECT * FROM ${table} WHERE ${whereSql} LIMIT 1`, params)
@@ -362,7 +384,10 @@ export async function chCount(service: PayloadDatabaseService, collection: strin
   try {
     const table = 'events'
     const skipNs = true
-    const baseFilter = CH_COLLECTION_FILTERS[collection]
+    let baseFilter = CH_COLLECTION_FILTERS[collection]
+    if (!hasTimeFilter(where)) {
+      baseFilter = baseFilter ? `${baseFilter} AND ${DEFAULT_TIME_WINDOW}` : DEFAULT_TIME_WINDOW
+    }
     const { sql: whereSql, params } = buildCHWhere(where, context, skipNs, baseFilter)
 
     const result = (await service.chQuery(`SELECT count() AS total FROM ${table} WHERE ${whereSql}`, params)) as { data: { total: number }[] }
@@ -381,13 +406,17 @@ export function buildCHOrderClause(sort: string | string[] | undefined): string 
     if (!sortStr) continue
     const dir = sortStr.startsWith('-') ? 'DESC' : 'ASC'
     const field = sortStr.replace(/^-/, '')
-    const col = chColumn(field)
+    let col = chColumn(field)
+    // Remap id sorts to ts: ORDER BY id OOMs on large tables (273M+ rows, 1,463 parts).
+    // Since IDs are ULIDs (time-sorted), ts gives equivalent chronological ordering
+    // and uses ClickHouse's streaming top-N optimization that fits in memory.
+    if (col === 'id') col = 'ts'
     if (col) {
       parts.push(`${col} ${dir}`)
     }
   }
 
-  if (parts.length === 0) return 'ORDER BY id DESC'
+  if (parts.length === 0) return 'ORDER BY ts DESC'
   return `ORDER BY ${parts.join(', ')}`
 }
 
@@ -423,4 +452,163 @@ function chRowToDocument(row: Record<string, unknown>, collection?: string): Rec
   }
 
   return doc
+}
+
+// ─── Versions-backed Collections ───────────────────────────────────
+
+/**
+ * Map from Payload collection slug to ClickHouse versions table filter.
+ * These collections are read-only in Payload — data flows in via the seed script.
+ */
+export const VERSIONS_COLLECTIONS = new Map<string, { ns: string; type: string }>([
+  ['models', { ns: 'openrouter', type: 'Model' }],
+  ['domains', { ns: 'registry.do', type: 'Domain' }],
+])
+
+const VERSIONS_COLUMNS = 'id, name, data, meta, v, e'
+
+/** Flatten a versions row into a Payload-compatible document. */
+function versionRowToDocument(row: Record<string, unknown>): Record<string, unknown> {
+  let data = row.data
+  if (typeof data === 'string') {
+    try {
+      data = JSON.parse(data as string)
+    } catch {
+      data = {}
+    }
+  }
+  let meta = row.meta
+  if (typeof meta === 'string') {
+    try {
+      meta = JSON.parse(meta as string)
+    } catch {
+      meta = {}
+    }
+  }
+
+  const ts = row.v ? new Date(Number(row.v)).toISOString() : new Date().toISOString()
+
+  return {
+    id: row.id,
+    name: row.name,
+    ...(data && typeof data === 'object' ? (data as Record<string, unknown>) : {}),
+    _version: row.v,
+    _hash: row.e,
+    _meta: meta,
+    createdAt: ts,
+    updatedAt: ts,
+  }
+}
+
+export async function versionFind(
+  service: PayloadDatabaseService,
+  config: { ns: string; type: string },
+  args: { where?: Where; sort?: string | string[]; limit?: number; page?: number; pagination?: boolean },
+): Promise<{ docs: Record<string, unknown>[]; totalDocs: number }> {
+  try {
+    const { where, limit: rawLimit = 10, page = 1, pagination = true } = args
+    const limit = pagination ? rawLimit : 0
+    const params: Record<string, string | number> = { ns: config.ns, type: config.type }
+
+    let whereSql = 'ns = {ns:String} AND type = {type:String}'
+    if (where) {
+      const extra = buildVersionsWhere(where, params)
+      if (extra) whereSql += ` AND ${extra}`
+    }
+
+    const countSql = `SELECT count() AS total FROM versions FINAL WHERE ${whereSql}`
+    let dataSql = `SELECT ${VERSIONS_COLUMNS} FROM versions FINAL WHERE ${whereSql} ORDER BY v DESC`
+
+    if (limit > 0) {
+      params.lim = limit
+      params.off = (page - 1) * limit
+      dataSql += ' LIMIT {lim:UInt32} OFFSET {off:UInt32}'
+    }
+
+    const [countResult, result] = await Promise.all([
+      service.chQuery(countSql, params) as Promise<{ data: { total: number }[] }>,
+      service.chQuery(dataSql, params),
+    ])
+
+    return {
+      totalDocs: countResult.data[0]?.total ?? 0,
+      docs: result.data.map(versionRowToDocument),
+    }
+  } catch (err) {
+    console.error(`versionFind(${config.ns}/${config.type}) failed:`, err)
+    return { docs: [], totalDocs: 0 }
+  }
+}
+
+export async function versionFindOne(
+  service: PayloadDatabaseService,
+  config: { ns: string; type: string },
+  where?: Where,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const params: Record<string, string | number> = { ns: config.ns, type: config.type }
+    let whereSql = 'ns = {ns:String} AND type = {type:String}'
+    if (where) {
+      const extra = buildVersionsWhere(where, params)
+      if (extra) whereSql += ` AND ${extra}`
+    }
+
+    const result = await service.chQuery(`SELECT * FROM versions FINAL WHERE ${whereSql} ORDER BY v DESC LIMIT 1`, params)
+    if (result.data.length === 0) return null
+    return versionRowToDocument(result.data[0])
+  } catch (err) {
+    console.error(`versionFindOne(${config.ns}/${config.type}) failed:`, err)
+    return null
+  }
+}
+
+export async function versionCount(
+  service: PayloadDatabaseService,
+  config: { ns: string; type: string },
+  where?: Where,
+): Promise<number> {
+  try {
+    const params: Record<string, string | number> = { ns: config.ns, type: config.type }
+    let whereSql = 'ns = {ns:String} AND type = {type:String}'
+    if (where) {
+      const extra = buildVersionsWhere(where, params)
+      if (extra) whereSql += ` AND ${extra}`
+    }
+
+    const result = (await service.chQuery(`SELECT count() AS total FROM versions FINAL WHERE ${whereSql}`, params)) as { data: { total: number }[] }
+    return result.data[0]?.total ?? 0
+  } catch (err) {
+    console.error(`versionCount(${config.ns}/${config.type}) failed:`, err)
+    return 0
+  }
+}
+
+/** Build simple WHERE conditions for versions table queries. */
+function buildVersionsWhere(where: Where, params: Record<string, string | number>): string {
+  const conditions: string[] = []
+  let idx = 100
+
+  for (const [field, operators] of Object.entries(where)) {
+    if (field === 'and' || field === 'or') continue
+    if (typeof operators !== 'object' || operators === null) continue
+
+    const col = field === 'id' ? 'id' : field === 'name' ? 'name' : null
+    if (!col) continue
+
+    for (const [op, value] of Object.entries(operators as Record<string, unknown>)) {
+      const p = `vp${idx++}`
+      if (op === 'equals' && value != null) {
+        params[p] = value as string
+        conditions.push(`${col} = {${p}:String}`)
+      } else if (op === 'contains' && value) {
+        params[p] = `%${String(value).replace(/[%_\\]/g, '\\$&')}%`
+        conditions.push(`${col} LIKE {${p}:String}`)
+      } else if (op === 'not_equals' && value != null) {
+        params[p] = value as string
+        conditions.push(`${col} != {${p}:String}`)
+      }
+    }
+  }
+
+  return conditions.join(' AND ')
 }
