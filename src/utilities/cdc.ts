@@ -13,15 +13,17 @@
 
 const ENCODING = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
 
-export function ulid(): string {
+export function ulid(timestamp?: number): string {
   let str = ''
-  let ts = Date.now()
+  let ts = timestamp ?? Date.now()
   for (let i = 9; i >= 0; i--) {
     str = ENCODING[ts % 32] + str
     ts = Math.floor(ts / 32)
   }
+  const random = new Uint8Array(16)
+  crypto.getRandomValues(random)
   for (let i = 0; i < 16; i++) {
-    str += ENCODING[Math.floor(Math.random() * 32)]
+    str += ENCODING[random[i] % 32]
   }
   return str
 }
