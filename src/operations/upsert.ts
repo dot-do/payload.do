@@ -1,14 +1,11 @@
 import type { Upsert } from 'payload'
 import type { DoPayloadAdapter } from '../types.js'
-import { entityToDocument, documentToEntityData, slugToType } from '../utilities/transforms.js'
+import { entityToDocument, documentToEntityData } from '../utilities/transforms.js'
 import { buildCdcEvent } from '../utilities/cdc.js'
-import { translateWhere } from '../queries/where.js'
 import { THINGS_COLLECTION, thingsFindOne, thingsResolveType } from './things.js'
 
 export const upsert: Upsert = async function upsert(this: DoPayloadAdapter, args) {
   const { collection, data, where } = args
-
-  const ts = new Date().toISOString()
 
   if (collection === THINGS_COLLECTION) {
     // Things: find across all types
@@ -61,44 +58,6 @@ export const upsert: Upsert = async function upsert(this: DoPayloadAdapter, args
     return doc as any
   }
 
-  // Standard collection path
-  const type = slugToType(collection)
-  const filter = translateWhere(where)
-
-  const existing = await this._service.findOne(this.namespace, type, filter)
-
-  if (existing) {
-    const entityId = existing.$id as string
-    const updateData = documentToEntityData(data)
-    const updated = await this._service.update(this.namespace, type, entityId, updateData)
-    if (!updated) throw new Error(`Failed to update document in ${collection}`)
-
-    const doc = entityToDocument(updated)
-
-    try {
-      await this._service.sendEvent(this.namespace, buildCdcEvent({
-        id: entityId, ns: this.context, event: `${collection}.updated`,
-        entityType: type, entityData: updateData,
-      }))
-    } catch (err) {
-      console.error('[cdc] Event emission failed:', err)
-    }
-
-    return doc as any
-  }
-
-  const entityData = documentToEntityData(data)
-  const created = (await this._service.create(this.namespace, type, entityData)) as Record<string, unknown>
-  const doc = entityToDocument(created)
-
-  try {
-    await this._service.sendEvent(this.namespace, buildCdcEvent({
-      id: created.$id as string, ns: this.context, event: `${collection}.created`,
-      entityType: type, entityData,
-    }))
-  } catch (err) {
-    console.error('[cdc] Event emission failed:', err)
-  }
-
-  return doc as any
+  // Standard collections: single compound call (find → update or create + CDC)
+  return this._service.payloadUpsert(this.namespace, collection, where, data, this.context) as any
 }

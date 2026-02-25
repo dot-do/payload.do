@@ -1,9 +1,7 @@
 import type { Count } from 'payload'
 import type { DoPayloadAdapter } from '../types.js'
-import { slugToType } from '../utilities/transforms.js'
-import { translateWhere } from '../queries/where.js'
 import { CH_COLLECTIONS, chCount, VERSIONS_COLLECTIONS, versionCount } from './analytics.js'
-import { THINGS_COLLECTION, thingsCount } from './things.js'
+import { THINGS_COLLECTION } from './things.js'
 
 export const count: Count = async function count(this: DoPayloadAdapter, args) {
   const { collection, where } = args
@@ -21,13 +19,9 @@ export const count: Count = async function count(this: DoPayloadAdapter, args) {
 
   // Things = universal view (no type filter)
   if (collection === THINGS_COLLECTION) {
-    const totalDocs = await thingsCount(this._service, this.namespace, where)
-    return { totalDocs }
+    return this._service.payloadThingsCount(this.namespace, where)
   }
 
-  const type = slugToType(collection)
-  const filter = translateWhere(where)
-
-  const totalDocs = await this._service.count(this.namespace, type, filter)
-  return { totalDocs }
+  // Standard collections: single compound call
+  return this._service.payloadCount(this.namespace, collection, where)
 }

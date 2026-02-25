@@ -1,14 +1,10 @@
 import type { DeleteMany } from 'payload'
 import type { DoPayloadAdapter } from '../types.js'
-import { slugToType } from '../utilities/transforms.js'
 import { buildCdcEvent } from '../utilities/cdc.js'
-import { translateWhere } from '../queries/where.js'
 import { THINGS_COLLECTION, thingsFind, thingsResolveType } from './things.js'
 
 export const deleteMany: DeleteMany = async function deleteMany(this: DoPayloadAdapter, args) {
   const { collection, where } = args
-
-  const ts = new Date().toISOString()
 
   if (collection === THINGS_COLLECTION) {
     // Things: find across all types, resolve type per entity
@@ -30,18 +26,12 @@ export const deleteMany: DeleteMany = async function deleteMany(this: DoPayloadA
       }
     }
   } else {
-    const type = slugToType(collection)
-    const filter = translateWhere(where)
-    const result = await this._service.find(this.namespace, type, filter, { limit: 10000 })
+    // Standard collections: compound find + loop compound deletes
+    const result = (await this._service.payloadFind(this.namespace, collection, where, undefined, 10000, 1, false)) as any
 
-    for (const entity of result.items) {
-      const entityId = entity.$id as string
+    for (const doc of result.docs ?? []) {
       try {
-        await this._service.delete(this.namespace, type, entityId)
-        await this._service.sendEvent(this.namespace, buildCdcEvent({
-          id: entityId, ns: this.context, event: `${collection}.deleted`,
-          entityType: type, entityData: { $id: entityId },
-        }))
+        await this._service.payloadDeleteOne(this.namespace, collection, { id: { equals: doc.id } }, this.context)
       } catch {
         // fire-and-forget
       }

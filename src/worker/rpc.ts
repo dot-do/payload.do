@@ -4,11 +4,19 @@
  * Consumer apps bind to this entrypoint via service binding:
  *   { "binding": "PAYLOAD_DB", "service": "dotdo-payload", "entrypoint": "PayloadDatabaseRPC" }
  *
- * Each method resolves a DO stub from the namespace parameter and delegates
- * to the DO's collection interface via fetch() or RPC methods.
+ * Entity CRUD (find, findOne, get, create, update, delete, count) uses
+ * direct Workers RPC via DO stub — each call is a single atomic operation.
+ *
+ * SQLite methods (query, queryFirst, run, exec, batchInsert, atomicCreate,
+ * atomicUpsert) route through a capnweb WebSocket to the DO. The WS session
+ * is cached in module-scope memory so it persists across requests in the same
+ * isolate. Capnweb auto-batches concurrent calls into single WS frames.
+ *
+ * Non-SQLite paths (ClickHouse, Pipeline CDC) bypass the DO entirely.
  */
 
 import { WorkerEntrypoint } from 'cloudflare:workers'
+import { newWebSocketRpcSession } from '@dotdo/capnweb'
 import type { PayloadDatabaseService } from '../types.js'
 
 /** Slack notification rule shape stored in Integration.configSchema */
@@ -36,11 +44,118 @@ function materialize<T>(value: T): T {
   return JSON.parse(JSON.stringify(value))
 }
 
+// =============================================================================
+// Module-scope capnweb WebSocket session cache
+// =============================================================================
+
+/** Cached WS session per namespace — persists across requests in same isolate */
+const wsSessions = new Map<string, { remote: any; ws: WebSocket; closed: boolean }>()
+
+/** In-flight connection promises — prevents duplicate connections for same ns */
+const wsConnecting = new Map<string, Promise<any>>()
+
+/**
+ * Get or create a capnweb WS session to the DO for the given namespace.
+ * The session is cached in module-scope memory so isolate reuse = WS reuse.
+ */
+async function getWsSession(doNs: DurableObjectNamespace, ns: string): Promise<any> {
+  // Fast path: reuse existing session
+  const cached = wsSessions.get(ns)
+  if (cached && !cached.closed) return cached.remote
+
+  // Deduplicate concurrent connection attempts
+  const pending = wsConnecting.get(ns)
+  if (pending) return pending
+
+  const promise = (async () => {
+    try {
+      const doId = doNs.idFromName(ns)
+      const stub = doNs.get(doId)
+
+      // Open WS to the DO via stub.fetch() with Upgrade header
+      const resp = await stub.fetch('http://do/ws', {
+        headers: { Upgrade: 'websocket' },
+      })
+
+      const ws = resp.webSocket
+      if (!ws) throw new Error('DO did not return WebSocket')
+      ws.accept()
+
+      // Create capnweb session — remote is a Proxy with .query(), .run(), etc.
+      const remote = newWebSocketRpcSession(ws)
+
+      const entry = { remote, ws, closed: false }
+      ws.addEventListener('close', () => {
+        entry.closed = true
+        wsSessions.delete(ns)
+      })
+      ws.addEventListener('error', () => {
+        entry.closed = true
+        wsSessions.delete(ns)
+      })
+
+      wsSessions.set(ns, entry)
+      return remote
+    } finally {
+      wsConnecting.delete(ns)
+    }
+  })()
+
+  wsConnecting.set(ns, promise)
+  return promise
+}
+
+// =============================================================================
+// PayloadDatabaseRPC
+// =============================================================================
+
 export class PayloadDatabaseRPC extends WorkerEntrypoint<Env> implements PayloadDatabaseService {
-  private getStub(ns: string): DurableObjectStub {
-    const id = this.env.PAYLOAD_DO.idFromName(ns)
-    return this.env.PAYLOAD_DO.get(id)
+  /** Cached DO colo (fetched once per entrypoint instance) */
+  private _doColo: Map<string, string> = new Map()
+
+  /** Get a DO stub for direct Workers RPC (entity CRUD) */
+  private getStub(ns: string): any {
+    const doId = this.env.PAYLOAD_DO.idFromName(ns)
+    return this.env.PAYLOAD_DO.get(doId)
   }
+
+  /** Get a capnweb WS remote for the given namespace (SQL methods) */
+  private getWs(ns: string): Promise<any> {
+    return getWsSession(this.env.PAYLOAD_DO, ns)
+  }
+
+  /**
+   * Call a method on the capnweb WS remote with single retry on transport failure.
+   * If the WS is stale (DO hibernated, network blip), clears cache and retries once.
+   */
+  private async callWs(ns: string, method: string, args: unknown[]): Promise<any> {
+    try {
+      const remote = await this.getWs(ns)
+      return await (remote as any)[method](...args)
+    } catch (err) {
+      // Clear stale session and retry once
+      wsSessions.delete(ns)
+      const remote = await this.getWs(ns)
+      return await (remote as any)[method](...args)
+    }
+  }
+
+  /** Log perf trace (picked up by tail worker → ClickHouse) */
+  private logPerf(method: string, ns: string, ms: number, extra?: Record<string, unknown>) {
+    console.log(JSON.stringify({
+      _tag: 'payload-rpc',
+      method,
+      ns,
+      ms,
+      doColo: this._doColo.get(ns) ?? 'unknown',
+      ...extra,
+    }))
+  }
+
+  // ===========================================================================
+  // Entity CRUD — direct Workers RPC via DO stub
+  // Each call is a single atomic operation; no batching benefit from WS.
+  // ===========================================================================
 
   async find(
     ns: string,
@@ -48,124 +163,226 @@ export class PayloadDatabaseRPC extends WorkerEntrypoint<Env> implements Payload
     filter?: Record<string, unknown>,
     opts?: { limit?: number; offset?: number; sort?: Record<string, 1 | -1> },
   ): Promise<{ items: Record<string, unknown>[]; total: number; hasMore: boolean }> {
+    const start = Date.now()
     const stub = this.getStub(ns)
-    const result = await (stub as any).find(type, filter, opts)
-    return materialize(result)
+    const result = await stub.find(type, filter, opts)
+    const materialized = materialize(result)
+    this.logPerf('find', ns, Date.now() - start, { type, count: materialized.items?.length, transport: 'rpc' })
+    return materialized
   }
 
   async findOne(ns: string, type: string, filter?: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    const start = Date.now()
     const stub = this.getStub(ns)
-    // Use the DO's find() with limit 1 and translate
-    const result = await (stub as any).find(type, filter, { limit: 1 })
-    const materialized = materialize(result)
-    return materialized.items[0] ?? null
+    const result = await stub.findOne(type, filter)
+    const materialized = result ? materialize(result) : null
+    this.logPerf('findOne', ns, Date.now() - start, { type, transport: 'rpc' })
+    return materialized
   }
 
   async get(ns: string, type: string, id: string): Promise<Record<string, unknown> | null> {
+    const start = Date.now()
     const stub = this.getStub(ns)
-    const result = await (stub as any).getEntity(type, id)
-    return result ? materialize(result) : null
+    const result = await stub.get(type, id)
+    const materialized = result ? materialize(result) : null
+    this.logPerf('get', ns, Date.now() - start, { type, id, transport: 'rpc' })
+    return materialized
   }
 
   async create(ns: string, type: string, data: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const start = Date.now()
     const stub = this.getStub(ns)
-    // Use the fetch API to hit the DO's collection create
-    const url = `https://do/entity/${encodeURIComponent(type)}`
-    const response = await stub.fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Namespace': ns,
-      },
-      body: JSON.stringify(data),
-    })
-    if (!response.ok) {
-      const error = await response.text()
-      throw new Error(`Create failed: ${error}`)
-    }
-    return response.json()
+    const result = await stub.create(type, data)
+    const materialized = materialize(result)
+    this.logPerf('create', ns, Date.now() - start, { type, transport: 'rpc' })
+    return materialized
   }
 
   async update(ns: string, type: string, id: string, data: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    const start = Date.now()
     const stub = this.getStub(ns)
-    const url = `https://do/entity/${encodeURIComponent(type)}/${encodeURIComponent(id)}`
-    const response = await stub.fetch(url, {
-      method: 'PUT',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Namespace': ns,
-      },
-      body: JSON.stringify(data),
-    })
-    if (!response.ok) {
-      if (response.status === 404) return null
-      const error = await response.text()
-      throw new Error(`Update failed: ${error}`)
-    }
-    return response.json()
+    const result = await stub.update(type, id, data)
+    const materialized = result ? materialize(result) : null
+    this.logPerf('update', ns, Date.now() - start, { type, id, transport: 'rpc' })
+    return materialized
   }
 
   async delete(ns: string, type: string, id: string): Promise<{ deletedCount: number }> {
+    const start = Date.now()
     const stub = this.getStub(ns)
-    const url = `https://do/entity/${encodeURIComponent(type)}/${encodeURIComponent(id)}`
-    const response = await stub.fetch(url, {
-      method: 'DELETE',
-      headers: { 'X-Namespace': ns },
-    })
-    if (!response.ok) {
-      return { deletedCount: 0 }
-    }
-    return response.json()
+    const result = await stub.delete(type, id)
+    const materialized = materialize(result)
+    this.logPerf('delete', ns, Date.now() - start, { type, id, transport: 'rpc' })
+    return materialized
   }
 
   async count(ns: string, type: string, filter?: Record<string, unknown>): Promise<number> {
+    const start = Date.now()
     const stub = this.getStub(ns)
-    // Use the DO's find to count (filter in-memory)
-    const result = await (stub as any).find(type, filter, { limit: 0 })
-    return materialize(result).total ?? 0
+    const result = await stub.count(type, filter)
+    const total = typeof result === 'number' ? result : (materialize(result) ?? 0)
+    this.logPerf('count', ns, Date.now() - start, { type, total, transport: 'rpc' })
+    return total as number
   }
 
-  async query(ns: string, sql: string, ...params: unknown[]): Promise<Record<string, unknown>[]> {
+  // ===========================================================================
+  // Compound methods — entire Payload operation in a single DO call
+  // Reads return Payload-formatted results; writes return doc + forward CDC
+  // ===========================================================================
+
+  async payloadFind(
+    ns: string,
+    collection: string,
+    where?: Record<string, unknown>,
+    sort?: string,
+    limit?: number,
+    page?: number,
+    pagination?: boolean,
+  ): Promise<Record<string, unknown>> {
+    const start = Date.now()
     const stub = this.getStub(ns)
-    const url = `https://do/query`
-    const response = await stub.fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Namespace': ns,
-      },
-      body: JSON.stringify({ sql, params }),
-    })
-    if (!response.ok) return []
-    const result = (await response.json()) as { rows?: Record<string, unknown>[] }
-    return result.rows ?? []
+    const result = await stub.payloadFind(collection, where, sort, limit, page, pagination)
+    const materialized = materialize(result)
+    this.logPerf('payloadFind', ns, Date.now() - start, { collection, transport: 'rpc' })
+    return materialized
+  }
+
+  async payloadFindOne(ns: string, collection: string, where?: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    const start = Date.now()
+    const stub = this.getStub(ns)
+    const result = await stub.payloadFindOne(collection, where)
+    const materialized = result ? materialize(result) : null
+    this.logPerf('payloadFindOne', ns, Date.now() - start, { collection, transport: 'rpc' })
+    return materialized
+  }
+
+  async payloadCount(ns: string, collection: string, where?: Record<string, unknown>): Promise<{ totalDocs: number }> {
+    const start = Date.now()
+    const stub = this.getStub(ns)
+    const result = await stub.payloadCount(collection, where)
+    const materialized = materialize(result)
+    this.logPerf('payloadCount', ns, Date.now() - start, { collection, transport: 'rpc' })
+    return materialized
+  }
+
+  async payloadThingsFind(
+    ns: string,
+    where?: Record<string, unknown>,
+    sort?: string,
+    limit?: number,
+    page?: number,
+    pagination?: boolean,
+  ): Promise<Record<string, unknown>> {
+    const start = Date.now()
+    const stub = this.getStub(ns)
+    const result = await stub.payloadThingsFind(where, sort, limit, page, pagination)
+    const materialized = materialize(result)
+    this.logPerf('payloadThingsFind', ns, Date.now() - start, { transport: 'rpc' })
+    return materialized
+  }
+
+  async payloadThingsCount(ns: string, where?: Record<string, unknown>): Promise<{ totalDocs: number }> {
+    const start = Date.now()
+    const stub = this.getStub(ns)
+    const result = await stub.payloadThingsCount(where)
+    const materialized = materialize(result)
+    this.logPerf('payloadThingsCount', ns, Date.now() - start, { transport: 'rpc' })
+    return materialized
+  }
+
+  async payloadCreate(ns: string, collection: string, data: Record<string, unknown>, context?: string): Promise<Record<string, unknown>> {
+    const start = Date.now()
+    const stub = this.getStub(ns)
+    const result = await stub.payloadCreate(collection, data, context)
+    const materialized = materialize(result)
+    if (materialized.cdcEvent) {
+      this.ctx.waitUntil(this.forwardCdcEvent(ns, materialized.cdcEvent))
+    }
+    this.logPerf('payloadCreate', ns, Date.now() - start, { collection, transport: 'rpc' })
+    return materialized.doc
+  }
+
+  async payloadUpdateOne(
+    ns: string,
+    collection: string,
+    where: Record<string, unknown> | undefined,
+    id: string | undefined,
+    data: Record<string, unknown>,
+    context?: string,
+  ): Promise<Record<string, unknown>> {
+    const start = Date.now()
+    const stub = this.getStub(ns)
+    const result = await stub.payloadUpdateOne(collection, where, id, data, context)
+    const materialized = materialize(result)
+    if (materialized.cdcEvent) {
+      this.ctx.waitUntil(this.forwardCdcEvent(ns, materialized.cdcEvent))
+    }
+    this.logPerf('payloadUpdateOne', ns, Date.now() - start, { collection, transport: 'rpc' })
+    return materialized.doc
+  }
+
+  async payloadDeleteOne(ns: string, collection: string, where: Record<string, unknown>, context?: string): Promise<Record<string, unknown>> {
+    const start = Date.now()
+    const stub = this.getStub(ns)
+    const result = await stub.payloadDeleteOne(collection, where, context)
+    const materialized = materialize(result)
+    if (materialized.cdcEvent) {
+      this.ctx.waitUntil(this.forwardCdcEvent(ns, materialized.cdcEvent))
+    }
+    this.logPerf('payloadDeleteOne', ns, Date.now() - start, { collection, transport: 'rpc' })
+    return materialized.doc
+  }
+
+  async payloadUpsert(
+    ns: string,
+    collection: string,
+    where: Record<string, unknown>,
+    data: Record<string, unknown>,
+    context?: string,
+  ): Promise<Record<string, unknown>> {
+    const start = Date.now()
+    const stub = this.getStub(ns)
+    const result = await stub.payloadUpsert(collection, where, data, context)
+    const materialized = materialize(result)
+    if (materialized.cdcEvent) {
+      this.ctx.waitUntil(this.forwardCdcEvent(ns, materialized.cdcEvent))
+    }
+    this.logPerf('payloadUpsert', ns, Date.now() - start, { collection, transport: 'rpc' })
+    return materialized.doc
+  }
+
+  // ===========================================================================
+  // SQLite methods — routed through capnweb WS (batched, pipelined)
+  // ===========================================================================
+
+  async query(ns: string, sql: string, ...params: unknown[]): Promise<Record<string, unknown>[]> {
+    const start = Date.now()
+    const result = await this.callWs(ns, 'query', [sql, ...params])
+    const materialized = materialize(result) as Record<string, unknown>[]
+    this.logPerf('query', ns, Date.now() - start, { rows: materialized.length, transport: 'ws' })
+    return materialized
   }
 
   async run(ns: string, sql: string, ...params: unknown[]): Promise<{ changes: number }> {
-    const stub = this.getStub(ns)
-    const url = `https://do/run`
-    const response = await stub.fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Namespace': ns,
-      },
-      body: JSON.stringify({ sql, params }),
-    })
-    if (!response.ok) return { changes: 0 }
-    return response.json()
+    const start = Date.now()
+    const result = await this.callWs(ns, 'run', [sql, ...params])
+    const materialized = materialize(result)
+    this.logPerf('run', ns, Date.now() - start, { transport: 'ws' })
+    return materialized
   }
 
   async exec(ns: string, sql: string): Promise<void> {
-    const stub = this.getStub(ns)
-    await (stub as any).exec(sql)
+    const start = Date.now()
+    await this.callWs(ns, 'exec', [sql])
+    this.logPerf('exec', ns, Date.now() - start, { transport: 'ws' })
   }
 
   async queryFirst(ns: string, sql: string, ...params: unknown[]): Promise<Record<string, unknown> | null> {
-    const stub = this.getStub(ns)
-    const row = await (stub as any).queryFirst(sql, ...params)
-    if (row === null) return null
-    return materialize(row)
+    const start = Date.now()
+    const row = await this.callWs(ns, 'queryFirst', [sql, ...params])
+    const materialized = row === null ? null : materialize(row)
+    this.logPerf('queryFirst', ns, Date.now() - start, { transport: 'ws' })
+    return materialized
   }
 
   async batchInsert(
@@ -173,9 +390,11 @@ export class PayloadDatabaseRPC extends WorkerEntrypoint<Env> implements Payload
     type: string,
     rows: Array<{ title: string | null; c: number; v: number; data: string }>,
   ): Promise<{ changes: number; firstRowId: number; lastRowId: number }> {
-    const stub = this.getStub(ns)
-    const result = await (stub as any).batchInsert(type, rows)
-    return { changes: result.changes as number, firstRowId: result.firstRowId as number, lastRowId: result.lastRowId as number }
+    const start = Date.now()
+    const result = await this.callWs(ns, 'batchInsert', [type, rows])
+    const materialized = materialize(result)
+    this.logPerf('batchInsert', ns, Date.now() - start, { type, count: rows.length, transport: 'ws' })
+    return materialized
   }
 
   async atomicCreate(
@@ -188,10 +407,11 @@ export class PayloadDatabaseRPC extends WorkerEntrypoint<Env> implements Payload
     uniqueChecks: Array<{ field: string; value: unknown }>,
     emailCheck: { email: string } | null,
   ): Promise<{ lastRowId: number; error?: string; code?: string }> {
-    const stub = this.getStub(ns)
-    const result = await (stub as any).atomicCreate(type, title, c, v, data, uniqueChecks, emailCheck)
-    if (result.error) return { lastRowId: -1, error: result.error as string, code: result.code as string }
-    return { lastRowId: result.lastRowId as number }
+    const start = Date.now()
+    const result = await this.callWs(ns, 'atomicCreate', [type, title, c, v, data, uniqueChecks, emailCheck])
+    const materialized = materialize(result)
+    this.logPerf('atomicCreate', ns, Date.now() - start, { type, transport: 'ws' })
+    return materialized
   }
 
   async atomicUpsert(
@@ -206,12 +426,49 @@ export class PayloadDatabaseRPC extends WorkerEntrypoint<Env> implements Payload
     uniqueChecks?: Array<{ field: string; value: unknown }>,
     emailCheck?: { email: string } | null,
   ): Promise<{ existing: Record<string, unknown> | null; lastRowId: number; changes: number; error?: string; code?: string }> {
-    const stub = this.getStub(ns)
-    const result = await (stub as any).atomicUpsert(findSql, findParams, insertType, insertTitle, insertC, insertV, insertData, uniqueChecks, emailCheck)
-    return materialize(result)
+    const start = Date.now()
+    const result = await this.callWs(ns, 'atomicUpsert', [findSql, findParams, insertType, insertTitle, insertC, insertV, insertData, uniqueChecks, emailCheck])
+    const materialized = materialize(result)
+    this.logPerf('atomicUpsert', ns, Date.now() - start, { type: insertType, transport: 'ws' })
+    return materialized
+  }
+
+  // ===========================================================================
+  // Non-DO methods — sendEvent, ClickHouse, webhooks, Slack
+  // (These bypass the DO entirely — no batching needed)
+  // ===========================================================================
+
+  /**
+   * Forward a CDC event from a compound DO method to ClickHouse + webhooks + Slack.
+   * Pipeline send already happened inside the DO — this handles the external paths.
+   */
+  private async forwardCdcEvent(ns: string, event: Record<string, unknown>): Promise<void> {
+    // Direct ClickHouse insert
+    if (this.env.CLICKHOUSE_URL) {
+      try {
+        await this.chInsert('events', [event])
+      } catch (err) {
+        console.error('[cdc] ClickHouse forward failed:', err)
+      }
+    }
+
+    // Webhook + Slack dispatch (fire-and-forget)
+    if (event.type === 'cdc' && typeof event.event === 'string' && event.event.includes('.')) {
+      this.ctx.waitUntil(
+        this.dispatchWebhooks(ns, event).catch((err) => {
+          console.error('[PayloadDatabaseRPC] Webhook dispatch error:', err)
+        }),
+      )
+      this.ctx.waitUntil(
+        this.dispatchSlackNotifications(ns, event).catch((err) => {
+          console.error('[PayloadDatabaseRPC] Slack notification error:', err)
+        }),
+      )
+    }
   }
 
   async sendEvent(ns: string, event: Record<string, unknown>): Promise<void> {
+    const start = Date.now()
     // Validate event ID is a 26-char Crockford Base32 ULID
     const id = event.id as string | undefined
     if (!id || id.length !== 26 || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)) {
@@ -253,6 +510,25 @@ export class PayloadDatabaseRPC extends WorkerEntrypoint<Env> implements Payload
           console.error('[PayloadDatabaseRPC] Slack notification error:', err)
         }),
       )
+    }
+
+    this.logPerf('sendEvent', ns, Date.now() - start, { eventType: event.type, event: event.event })
+  }
+
+  /**
+   * Return the colo where the DO for this namespace is running.
+   * Useful for diagnosing latency issues.
+   */
+  async getDoLocation(ns: string): Promise<{ doColo: string }> {
+    const cached = this._doColo.get(ns)
+    if (cached) return { doColo: cached }
+    try {
+      const stub = this.getStub(ns)
+      const colo = await stub.getColo() as string
+      if (colo && colo !== 'unknown') this._doColo.set(ns, colo)
+      return { doColo: colo ?? 'unknown' }
+    } catch {
+      return { doColo: 'unknown' }
     }
   }
 

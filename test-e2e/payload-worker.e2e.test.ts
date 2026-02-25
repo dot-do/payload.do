@@ -39,7 +39,7 @@ describe('dotdo-payload worker — CRUD lifecycle', () => {
     expect(res.status).toBe(200)
     const body = (await res.json()) as Record<string, unknown>
     expect(body.ok).toBe(true)
-    expect(body.version).toBe('0.1.0')
+    expect(body.version).toMatch(/^\d+\.\d+\.\d+$/)
   })
 })
 

@@ -97,6 +97,64 @@ export async function countViaRPC(doProxy: DOProxy, type: string) {
   return (doProxy.stub as any).countEntities(type) as Promise<number>
 }
 
+// ===========================================================================
+// Compound method helpers (call DO methods directly via stub)
+// ===========================================================================
+
+/** payloadFind: compound find with pagination */
+export async function payloadFindViaRPC(doProxy: DOProxy, collection: string, where?: Record<string, unknown>, sort?: string, limit?: number, page?: number, pagination?: boolean) {
+  const result = await (doProxy.stub as any).payloadFind(collection, where, sort, limit, page, pagination)
+  return JSON.parse(JSON.stringify(result)) as { docs: Record<string, unknown>[]; totalDocs: number; totalPages: number; page: number; limit: number; hasNextPage: boolean; hasPrevPage: boolean }
+}
+
+/** payloadFindOne: compound findOne */
+export async function payloadFindOneViaRPC(doProxy: DOProxy, collection: string, where?: Record<string, unknown>) {
+  const result = await (doProxy.stub as any).payloadFindOne(collection, where)
+  return result ? JSON.parse(JSON.stringify(result)) as Record<string, unknown> : null
+}
+
+/** payloadCount: compound count */
+export async function payloadCountViaRPC(doProxy: DOProxy, collection: string, where?: Record<string, unknown>) {
+  const result = await (doProxy.stub as any).payloadCount(collection, where)
+  return JSON.parse(JSON.stringify(result)) as { totalDocs: number }
+}
+
+/** payloadCreate: compound create */
+export async function payloadCreateViaRPC(doProxy: DOProxy, collection: string, data: Record<string, unknown>, context?: string) {
+  const result = await (doProxy.stub as any).payloadCreate(collection, data, context)
+  return JSON.parse(JSON.stringify(result)) as { doc: Record<string, unknown>; cdcEvent: Record<string, unknown> | null }
+}
+
+/** payloadUpdateOne: compound updateOne */
+export async function payloadUpdateOneViaRPC(doProxy: DOProxy, collection: string, where: Record<string, unknown> | undefined, id: string | undefined, data: Record<string, unknown>, context?: string) {
+  const result = await (doProxy.stub as any).payloadUpdateOne(collection, where, id, data, context)
+  return JSON.parse(JSON.stringify(result)) as { doc: Record<string, unknown>; cdcEvent: Record<string, unknown> | null }
+}
+
+/** payloadDeleteOne: compound deleteOne */
+export async function payloadDeleteOneViaRPC(doProxy: DOProxy, collection: string, where: Record<string, unknown>, context?: string) {
+  const result = await (doProxy.stub as any).payloadDeleteOne(collection, where, context)
+  return JSON.parse(JSON.stringify(result)) as { doc: Record<string, unknown>; cdcEvent: Record<string, unknown> | null }
+}
+
+/** payloadUpsert: compound upsert */
+export async function payloadUpsertViaRPC(doProxy: DOProxy, collection: string, where: Record<string, unknown>, data: Record<string, unknown>, context?: string) {
+  const result = await (doProxy.stub as any).payloadUpsert(collection, where, data, context)
+  return JSON.parse(JSON.stringify(result)) as { doc: Record<string, unknown>; cdcEvent: Record<string, unknown> | null }
+}
+
+/** payloadThingsFind: compound Things find */
+export async function payloadThingsFindViaRPC(doProxy: DOProxy, where?: Record<string, unknown>, sort?: string, limit?: number, page?: number, pagination?: boolean) {
+  const result = await (doProxy.stub as any).payloadThingsFind(where, sort, limit, page, pagination)
+  return JSON.parse(JSON.stringify(result)) as { docs: Record<string, unknown>[]; totalDocs: number; totalPages: number; page: number; limit: number; hasNextPage: boolean; hasPrevPage: boolean }
+}
+
+/** payloadThingsCount: compound Things count */
+export async function payloadThingsCountViaRPC(doProxy: DOProxy, where?: Record<string, unknown>) {
+  const result = await (doProxy.stub as any).payloadThingsCount(where)
+  return JSON.parse(JSON.stringify(result)) as { totalDocs: number }
+}
+
 /** Sleep helper */
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))

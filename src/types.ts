@@ -65,6 +65,19 @@ export interface PayloadDatabaseService {
   // ClickHouse operations (for analytics collections + version queries)
   chQuery(sql: string, params?: Record<string, string | number>): Promise<{ data: Record<string, unknown>[] }>
   chInsert(table: string, rows: Record<string, unknown>[]): Promise<void>
+
+  // Compound methods — entire Payload operation in a single DO call
+  // Reads: slug→type + where translation + entity query + migration-on-read + pagination
+  payloadFind(ns: string, collection: string, where?: Record<string, unknown>, sort?: string, limit?: number, page?: number, pagination?: boolean): Promise<Record<string, unknown>>
+  payloadFindOne(ns: string, collection: string, where?: Record<string, unknown>): Promise<Record<string, unknown> | null>
+  payloadCount(ns: string, collection: string, where?: Record<string, unknown>): Promise<{ totalDocs: number }>
+  payloadThingsFind(ns: string, where?: Record<string, unknown>, sort?: string, limit?: number, page?: number, pagination?: boolean): Promise<Record<string, unknown>>
+  payloadThingsCount(ns: string, where?: Record<string, unknown>): Promise<{ totalDocs: number }>
+  // Writes: slug→type + noun stamping + entity CRUD + CDC event (Pipeline sent by DO, ClickHouse/webhooks by RPC)
+  payloadCreate(ns: string, collection: string, data: Record<string, unknown>, context?: string): Promise<Record<string, unknown>>
+  payloadUpdateOne(ns: string, collection: string, where: Record<string, unknown> | undefined, id: string | undefined, data: Record<string, unknown>, context?: string): Promise<Record<string, unknown>>
+  payloadDeleteOne(ns: string, collection: string, where: Record<string, unknown>, context?: string): Promise<Record<string, unknown>>
+  payloadUpsert(ns: string, collection: string, where: Record<string, unknown>, data: Record<string, unknown>, context?: string): Promise<Record<string, unknown>>
 }
 
 export interface DoPayloadArgs {

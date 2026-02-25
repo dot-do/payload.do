@@ -1,8 +1,5 @@
 import type { FindOne } from 'payload'
 import type { DoPayloadAdapter } from '../types.js'
-import { entityToDocument, slugToType } from '../utilities/transforms.js'
-import { resolveNounContext } from '../utilities/noun-cache.js'
-import { translateWhere } from '../queries/where.js'
 import { CH_COLLECTIONS, chFindOne, VERSIONS_COLLECTIONS, versionFindOne } from './analytics.js'
 import { THINGS_COLLECTION, thingsFindOne } from './things.js'
 
@@ -18,18 +15,11 @@ export const findOne: FindOne = async function findOne(this: DoPayloadAdapter, a
     return versionFindOne(this._service, versionConfig, where) as any
   }
 
-  // Things = universal view (no type filter)
+  // Things = universal view (no type filter) — keep existing SQL path
   if (collection === THINGS_COLLECTION) {
     return thingsFindOne(this._service, this.namespace, where) as any
   }
 
-  const type = slugToType(collection)
-  const filter = translateWhere(where)
-
-  const entity = await this._service.findOne(this.namespace, type, filter)
-  if (!entity) return null
-
-  // Resolve NounContext for migration-on-read
-  const nounCtx = await resolveNounContext(this._service, this.namespace, collection)
-  return entityToDocument(entity, nounCtx ?? undefined) as any
+  // Standard collections: single compound call (slug→type + query + migration-on-read)
+  return this._service.payloadFindOne(this.namespace, collection, where) as any
 }

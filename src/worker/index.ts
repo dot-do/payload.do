@@ -15,6 +15,7 @@ export { PayloadDatabaseRPC } from './rpc.js'
 export { PayloadDatabaseRPC as PayloadRPC } from './rpc.js'
 
 interface Env {
+  PAYLOAD_DO: DurableObjectNamespace
   CLICKHOUSE_URL?: string
   CLICKHOUSE_USERNAME?: string
   CLICKHOUSE_PASSWORD?: string
@@ -25,15 +26,31 @@ interface Env {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
+    const workerColo = (request as any).cf?.colo ?? 'unknown'
 
     if (url.pathname === '/health' || url.pathname === '/') {
       return Response.json({
         ok: true,
         service: 'dotdo-payload',
-        version: '0.1.0',
+        version: '0.2.0',
+        workerColo,
         clickhouse: !!env.CLICKHOUSE_URL,
         pipeline: !!env.EVENTS_PIPELINE,
       })
+    }
+
+    // Trace endpoint — returns worker colo + DO colo + round-trip latency (no auth required)
+    if (url.pathname === '/trace') {
+      const ns = url.searchParams.get('ns') || 'platform'
+      const start = Date.now()
+      const doId = env.PAYLOAD_DO.idFromName(ns)
+      const stub = env.PAYLOAD_DO.get(doId)
+      let doColo = 'unknown'
+      try {
+        doColo = await (stub as any).getColo() as string
+      } catch { /* DO may not have getColo yet */ }
+      const rpcMs = Date.now() - start
+      return Response.json({ workerColo, doColo, rpcMs, ns })
     }
 
     // All /test/* diagnostic routes require DIAGNOSTIC_TOKEN

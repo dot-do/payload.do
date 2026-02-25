@@ -9,7 +9,12 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { getTestDO, createEntity, getEntity, updateEntity, deleteEntity, querySQL, runSQL, findViaRPC, countViaRPC, sleep } from './helpers'
+import {
+  getTestDO, createEntity, getEntity, updateEntity, deleteEntity, querySQL, runSQL, findViaRPC, countViaRPC, sleep,
+  payloadFindViaRPC, payloadFindOneViaRPC, payloadCountViaRPC,
+  payloadCreateViaRPC, payloadUpdateOneViaRPC, payloadDeleteOneViaRPC, payloadUpsertViaRPC,
+  payloadThingsFindViaRPC, payloadThingsCountViaRPC,
+} from './helpers'
 
 describe('PayloadDatabaseDO — Entity CRUD (real DO)', () => {
   let doProxy: ReturnType<typeof getTestDO>
@@ -534,6 +539,346 @@ describe('PayloadDatabaseDO — Entity CRUD (real DO)', () => {
       expect(body.rows!.length).toBe(2)
       const types = body.rows!.map((r: any) => r.type).sort()
       expect(types).toEqual(['Contact', 'Deal'])
+    })
+  })
+})
+
+// =============================================================================
+// COMPOUND DO METHODS — single RPC call per Payload operation
+// =============================================================================
+
+describe('Compound DO methods (real DO)', () => {
+  let doProxy: ReturnType<typeof getTestDO>
+
+  beforeEach(() => {
+    doProxy = getTestDO()
+  })
+
+  // ===========================================================================
+  // payloadFind — compound find with pagination
+  // ===========================================================================
+
+  describe('payloadFind', () => {
+    it('returns Payload-formatted docs with pagination', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'Alice', email: 'alice@test.co' })
+      await createEntity(doProxy, 'Contact', { name: 'Bob', email: 'bob@test.co' })
+      await createEntity(doProxy, 'Contact', { name: 'Charlie', email: 'charlie@test.co' })
+
+      const result = await payloadFindViaRPC(doProxy, 'contacts')
+
+      expect(result.totalDocs).toBe(3)
+      expect(result.docs).toHaveLength(3)
+      expect(result.page).toBe(1)
+      expect(result.limit).toBe(10)
+      expect(result.totalPages).toBe(1)
+      expect(result.hasNextPage).toBe(false)
+      expect(result.hasPrevPage).toBe(false)
+      // Docs should have Payload field names (id, createdAt, updatedAt — not $id, $createdAt)
+      expect(result.docs[0].id).toBeDefined()
+      expect(result.docs[0].createdAt).toBeDefined()
+    })
+
+    it('applies Payload Where filters', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'Alice', stage: 'Lead' })
+      await createEntity(doProxy, 'Contact', { name: 'Bob', stage: 'Customer' })
+      await createEntity(doProxy, 'Contact', { name: 'Charlie', stage: 'Lead' })
+
+      const result = await payloadFindViaRPC(doProxy, 'contacts', { stage: { equals: 'Lead' } })
+
+      expect(result.totalDocs).toBe(2)
+      expect(result.docs).toHaveLength(2)
+    })
+
+    it('supports pagination (limit + page)', async () => {
+      for (let i = 0; i < 5; i++) {
+        await createEntity(doProxy, 'Contact', { name: `Contact ${i}` })
+      }
+
+      const page1 = await payloadFindViaRPC(doProxy, 'contacts', undefined, undefined, 2, 1)
+      expect(page1.docs).toHaveLength(2)
+      expect(page1.totalDocs).toBe(5)
+      expect(page1.hasNextPage).toBe(true)
+      expect(page1.totalPages).toBe(3)
+
+      const page3 = await payloadFindViaRPC(doProxy, 'contacts', undefined, undefined, 2, 3)
+      expect(page3.docs).toHaveLength(1)
+      expect(page3.hasNextPage).toBe(false)
+    })
+
+    it('supports sort', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'Charlie' })
+      await createEntity(doProxy, 'Contact', { name: 'Alice' })
+      await createEntity(doProxy, 'Contact', { name: 'Bob' })
+
+      const result = await payloadFindViaRPC(doProxy, 'contacts', undefined, 'name')
+      expect(result.docs[0].name).toBe('Alice')
+      expect(result.docs[1].name).toBe('Bob')
+      expect(result.docs[2].name).toBe('Charlie')
+    })
+  })
+
+  // ===========================================================================
+  // payloadFindOne
+  // ===========================================================================
+
+  describe('payloadFindOne', () => {
+    it('returns a single doc matching Where filter', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'Alice', email: 'alice@test.co' })
+      await createEntity(doProxy, 'Contact', { name: 'Bob', email: 'bob@test.co' })
+
+      const doc = await payloadFindOneViaRPC(doProxy, 'contacts', { email: { equals: 'alice@test.co' } })
+
+      expect(doc).not.toBeNull()
+      expect(doc!.name).toBe('Alice')
+      expect(doc!.id).toBeDefined()
+      expect(doc!.createdAt).toBeDefined()
+    })
+
+    it('returns null when not found', async () => {
+      const doc = await payloadFindOneViaRPC(doProxy, 'contacts', { email: { equals: 'nonexistent@test.co' } })
+      expect(doc).toBeNull()
+    })
+  })
+
+  // ===========================================================================
+  // payloadCount
+  // ===========================================================================
+
+  describe('payloadCount', () => {
+    it('returns totalDocs count', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'Alice' })
+      await createEntity(doProxy, 'Contact', { name: 'Bob' })
+      await createEntity(doProxy, 'Deal', { title: 'Deal' })
+
+      const result = await payloadCountViaRPC(doProxy, 'contacts')
+      expect(result.totalDocs).toBe(2)
+    })
+
+    it('applies Where filter to count', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'Alice', stage: 'Lead' })
+      await createEntity(doProxy, 'Contact', { name: 'Bob', stage: 'Customer' })
+
+      const result = await payloadCountViaRPC(doProxy, 'contacts', { stage: { equals: 'Lead' } })
+      expect(result.totalDocs).toBe(1)
+    })
+  })
+
+  // ===========================================================================
+  // payloadCreate
+  // ===========================================================================
+
+  describe('payloadCreate', () => {
+    it('creates entity and returns doc + cdcEvent', async () => {
+      const result = await payloadCreateViaRPC(doProxy, 'contacts', {
+        name: 'Alice',
+        email: 'alice@test.co',
+      }, 'https://headless.ly/~test')
+
+      expect(result.doc).toBeDefined()
+      expect(result.doc.id).toBeDefined()
+      expect(result.doc.name).toBe('Alice')
+      expect(result.doc.email).toBe('alice@test.co')
+      expect(result.doc.createdAt).toBeDefined()
+      expect(result.doc.updatedAt).toBeDefined()
+
+      expect(result.cdcEvent).toBeDefined()
+      expect(result.cdcEvent!.event).toBe('contacts.created')
+      expect(result.cdcEvent!.type).toBe('cdc')
+    })
+
+    it('stamps schema version when Noun exists', async () => {
+      // Create a Noun entity for contacts
+      await createEntity(doProxy, 'Noun', {
+        name: 'Contact',
+        slug: 'contacts',
+        schema: { name: 'string', email: 'string' },
+        migrations: [],
+      })
+
+      const result = await payloadCreateViaRPC(doProxy, 'contacts', { name: 'Alice' })
+      expect(result.doc._schemaVersion).toBeDefined()
+      expect(result.doc._schemaHash).toBeDefined()
+    })
+
+    it('entity is findable after create', async () => {
+      await payloadCreateViaRPC(doProxy, 'contacts', { name: 'Alice' })
+
+      const findResult = await payloadFindViaRPC(doProxy, 'contacts')
+      expect(findResult.totalDocs).toBe(1)
+      expect(findResult.docs[0].name).toBe('Alice')
+    })
+  })
+
+  // ===========================================================================
+  // payloadUpdateOne
+  // ===========================================================================
+
+  describe('payloadUpdateOne', () => {
+    it('updates entity by Where filter and returns updated doc + cdcEvent', async () => {
+      const { body } = await createEntity(doProxy, 'Contact', { name: 'Alice', email: 'old@test.co' })
+      const entityId = body.$id as string
+
+      const result = await payloadUpdateOneViaRPC(
+        doProxy, 'contacts',
+        { id: { equals: entityId } }, undefined,
+        { email: 'new@test.co' },
+        'https://headless.ly/~test',
+      )
+
+      expect(result.doc.email).toBe('new@test.co')
+      expect(result.doc.name).toBe('Alice') // preserved
+      expect(result.cdcEvent).toBeDefined()
+      expect(result.cdcEvent!.event).toBe('contacts.updated')
+    })
+
+    it('updates entity by direct ID', async () => {
+      const { body } = await createEntity(doProxy, 'Contact', { name: 'Alice', stage: 'Lead' })
+      const entityId = body.$id as string
+
+      const result = await payloadUpdateOneViaRPC(
+        doProxy, 'contacts',
+        undefined, entityId,
+        { stage: 'Customer' },
+      )
+
+      expect(result.doc.stage).toBe('Customer')
+      expect(result.doc.name).toBe('Alice')
+    })
+
+    it('throws when entity not found', async () => {
+      await expect(
+        payloadUpdateOneViaRPC(doProxy, 'contacts', { id: { equals: 'contact_nonexistent' } }, undefined, { name: 'Nope' }),
+      ).rejects.toThrow()
+    })
+  })
+
+  // ===========================================================================
+  // payloadDeleteOne
+  // ===========================================================================
+
+  describe('payloadDeleteOne', () => {
+    it('soft-deletes and returns deleted doc + cdcEvent', async () => {
+      const { body } = await createEntity(doProxy, 'Contact', { name: 'Alice' })
+      const entityId = body.$id as string
+
+      const result = await payloadDeleteOneViaRPC(
+        doProxy, 'contacts',
+        { id: { equals: entityId } },
+        'https://headless.ly/~test',
+      )
+
+      expect(result.doc.name).toBe('Alice')
+      expect(result.cdcEvent).toBeDefined()
+      expect(result.cdcEvent!.event).toBe('contacts.deleted')
+
+      // Verify entity is gone
+      const findResult = await payloadFindViaRPC(doProxy, 'contacts')
+      expect(findResult.totalDocs).toBe(0)
+    })
+
+    it('returns empty doc when not found', async () => {
+      const result = await payloadDeleteOneViaRPC(doProxy, 'contacts', { id: { equals: 'contact_nonexistent' } })
+      expect(result.cdcEvent).toBeNull()
+    })
+  })
+
+  // ===========================================================================
+  // payloadUpsert
+  // ===========================================================================
+
+  describe('payloadUpsert', () => {
+    it('creates when not found', async () => {
+      const result = await payloadUpsertViaRPC(
+        doProxy, 'contacts',
+        { email: { equals: 'alice@test.co' } },
+        { name: 'Alice', email: 'alice@test.co' },
+      )
+
+      expect(result.doc.name).toBe('Alice')
+      expect(result.cdcEvent).toBeDefined()
+      expect(result.cdcEvent!.event).toBe('contacts.created')
+    })
+
+    it('updates when found', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'Alice', email: 'alice@test.co', stage: 'Lead' })
+
+      const result = await payloadUpsertViaRPC(
+        doProxy, 'contacts',
+        { email: { equals: 'alice@test.co' } },
+        { name: 'Alice Updated', email: 'alice@test.co', stage: 'Customer' },
+      )
+
+      expect(result.doc.name).toBe('Alice Updated')
+      expect(result.doc.stage).toBe('Customer')
+      expect(result.cdcEvent).toBeDefined()
+      expect(result.cdcEvent!.event).toBe('contacts.updated')
+
+      // Only one entity should exist
+      const count = await payloadCountViaRPC(doProxy, 'contacts')
+      expect(count.totalDocs).toBe(1)
+    })
+  })
+
+  // ===========================================================================
+  // payloadThingsFind — universal cross-type query
+  // ===========================================================================
+
+  describe('payloadThingsFind', () => {
+    it('queries all entities across types', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'Alice' })
+      await createEntity(doProxy, 'Deal', { title: 'Big Deal', value: 50000 })
+      await createEntity(doProxy, 'Lead', { name: 'New Lead', source: 'web' })
+
+      const result = await payloadThingsFindViaRPC(doProxy)
+
+      expect(result.totalDocs).toBe(3)
+      expect(result.docs).toHaveLength(3)
+      const types = result.docs.map((d) => d.type).sort()
+      expect(types).toEqual(['Contact', 'Deal', 'Lead'])
+    })
+
+    it('filters by type field', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'Alice' })
+      await createEntity(doProxy, 'Contact', { name: 'Bob' })
+      await createEntity(doProxy, 'Deal', { title: 'Deal 1' })
+
+      const result = await payloadThingsFindViaRPC(doProxy, { type: { equals: 'Contact' } })
+      expect(result.totalDocs).toBe(2)
+    })
+
+    it('supports pagination', async () => {
+      for (let i = 0; i < 5; i++) {
+        await createEntity(doProxy, i % 2 === 0 ? 'Contact' : 'Deal', { name: `Entity ${i}` })
+      }
+
+      const page1 = await payloadThingsFindViaRPC(doProxy, undefined, undefined, 2, 1)
+      expect(page1.docs).toHaveLength(2)
+      expect(page1.totalDocs).toBe(5)
+      expect(page1.hasNextPage).toBe(true)
+    })
+
+    it('excludes soft-deleted entities', async () => {
+      const { body: contact } = await createEntity(doProxy, 'Contact', { name: 'Alice' })
+      await createEntity(doProxy, 'Deal', { title: 'Deal' })
+      await deleteEntity(doProxy, 'Contact', contact.$id as string)
+
+      const result = await payloadThingsFindViaRPC(doProxy)
+      expect(result.totalDocs).toBe(1)
+    })
+  })
+
+  // ===========================================================================
+  // payloadThingsCount
+  // ===========================================================================
+
+  describe('payloadThingsCount', () => {
+    it('counts all entities across types', async () => {
+      await createEntity(doProxy, 'Contact', { name: 'A' })
+      await createEntity(doProxy, 'Deal', { title: 'D' })
+      await createEntity(doProxy, 'Lead', { name: 'L' })
+
+      const result = await payloadThingsCountViaRPC(doProxy)
+      expect(result.totalDocs).toBe(3)
     })
   })
 })

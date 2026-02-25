@@ -38,9 +38,13 @@ function fieldToSql(field: string): string {
  * Build a WHERE clause + params from a Payload Where object.
  * Returns { sql, params } for use with the SQL escape hatch.
  */
-export function buildWhereSql(type: string, where?: PayloadWhere): { sql: string; params: unknown[] } {
-  const conditions: string[] = ['type = ?', 'deleted_at IS NULL']
-  const params: unknown[] = [type]
+export function buildWhereSql(type: string | null, where?: PayloadWhere): { sql: string; params: unknown[] } {
+  const conditions: string[] = ['deleted_at IS NULL']
+  const params: unknown[] = []
+  if (type !== null) {
+    conditions.unshift('type = ?')
+    params.unshift(type)
+  }
 
   if (where) {
     const result = buildConditions(where)
