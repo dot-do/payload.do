@@ -19,6 +19,24 @@ import { WorkerEntrypoint } from 'cloudflare:workers'
 import { newWebSocketRpcSession } from '@dotdo/capnweb'
 import type { PayloadDatabaseService } from '../types.js'
 
+/** Send pre-formatted event records to Pipeline (durable) and/or BufferDO (real-time CH). */
+async function emitRawRecords(
+  env: { EVENTS_PIPELINE?: { send(records: unknown[]): Promise<void> }; EVENTS?: { ingest(records: Record<string, unknown>[]): Promise<void> } },
+  records: Record<string, unknown>[],
+  ctx?: { waitUntil(p: Promise<unknown>): void },
+): Promise<void> {
+  if (records.length === 0) return
+  if (env.EVENTS_PIPELINE) {
+    try { await env.EVENTS_PIPELINE.send(records) }
+    catch (err) { console.error('[emit] Pipeline send failed:', err) }
+  }
+  if (env.EVENTS) {
+    const p = env.EVENTS.ingest(records).catch((err: unknown) =>
+      console.error('[emit] BufferDO ingest failed:', err))
+    ctx ? ctx.waitUntil(p) : await p
+  }
+}
+
 /** Slack notification rule shape stored in Integration.configSchema */
 interface SlackNotificationRule {
   entityType: string
@@ -32,6 +50,7 @@ interface SlackNotificationRule {
 interface Env {
   PAYLOAD_DO: DurableObjectNamespace
   EVENTS_PIPELINE?: { send(messages: unknown[]): Promise<void> }
+  EVENTS?: { ingest(events: Record<string, unknown>[]): Promise<void> }
   CLICKHOUSE_URL?: string
   CLICKHOUSE_USERNAME?: string
   CLICKHOUSE_PASSWORD?: string
@@ -439,18 +458,16 @@ export class PayloadDatabaseRPC extends WorkerEntrypoint<Env> implements Payload
   // ===========================================================================
 
   /**
-   * Forward a CDC event from a compound DO method to ClickHouse + webhooks + Slack.
+   * Forward a CDC event from a compound DO method to BufferDO (real-time CH) + webhooks + Slack.
    * Pipeline send already happened inside the DO — this handles the external paths.
    */
   private async forwardCdcEvent(ns: string, event: Record<string, unknown>): Promise<void> {
-    // Direct ClickHouse insert
-    if (this.env.CLICKHOUSE_URL) {
-      try {
-        await this.chInsert('events', [event])
-      } catch (err) {
-        console.error('[cdc] ClickHouse forward failed:', err)
-      }
-    }
+    // BufferDO real-time path (replaces direct ClickHouse insert)
+    await emitRawRecords(
+      { EVENTS_PIPELINE: undefined, EVENTS: this.env.EVENTS },
+      [event],
+      this.ctx,
+    )
 
     // Webhook + Slack dispatch (fire-and-forget)
     if (event.type === 'cdc' && typeof event.event === 'string' && event.event.includes('.')) {
@@ -476,27 +493,12 @@ export class PayloadDatabaseRPC extends WorkerEntrypoint<Env> implements Payload
       return
     }
 
-    const promises: Promise<void>[] = []
-
-    // Pipeline (durable log — R2 → S3Queue → ClickHouse)
-    if (this.env.EVENTS_PIPELINE) {
-      promises.push(
-        this.env.EVENTS_PIPELINE.send([event]).catch((err: unknown) => {
-          console.error('[cdc] Pipeline send failed:', err)
-        }),
-      )
-    }
-
-    // Direct ClickHouse insert (reliable, fast)
-    if (this.env.CLICKHOUSE_URL) {
-      promises.push(
-        this.chInsert('events', [event]).catch((err: unknown) => {
-          console.error('[cdc] ClickHouse direct insert failed:', err)
-        }),
-      )
-    }
-
-    await Promise.allSettled(promises)
+    // Unified dual-write: Pipeline (durable) + BufferDO (real-time CH)
+    await emitRawRecords(
+      { EVENTS_PIPELINE: this.env.EVENTS_PIPELINE, EVENTS: this.env.EVENTS },
+      [event],
+      this.ctx,
+    )
 
     // Dispatch to registered webhook subscriptions via waitUntil (non-blocking)
     if (event.type === 'cdc' && typeof event.event === 'string' && event.event.includes('.')) {

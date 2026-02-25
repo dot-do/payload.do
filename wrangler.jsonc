@@ -9,6 +9,9 @@
       { "name": "PAYLOAD_DO", "class_name": "PayloadDatabaseDO" }
     ]
   },
+  "services": [
+    { "binding": "EVENTS", "service": "events", "entrypoint": "EventsService" }
+  ],
   "pipelines": [
     { "binding": "EVENTS_PIPELINE", "pipeline": "d8f32274e86b42f68624144111579a26" }
   ],

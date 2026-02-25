@@ -102,7 +102,6 @@ export function buildCdcEvent(opts: CdcEventOptions): Record<string, unknown> {
     id: ulid(),
     ray: '',
     ns: opts.ns,
-    ts: new Date().toISOString(),
     type: 'cdc',
     event: opts.event,
     source: opts.source ?? 'platform',

@@ -29,6 +29,21 @@ import { buildPagination } from '../utilities/pagination.js'
 import { computeSchemaHash } from '../utilities/schema-hash.js'
 import type { MigrationDef } from '../utilities/migrate.js'
 import { buildCdcEvent } from '../utilities/cdc.js'
+/** Send pre-formatted event records to Pipeline (durable) and/or BufferDO (real-time CH). */
+async function emitRawRecords(
+  env: { EVENTS_PIPELINE?: { send(records: unknown[]): Promise<void> }; EVENTS?: { ingest(records: Record<string, unknown>[]): Promise<void> } },
+  records: Record<string, unknown>[],
+): Promise<void> {
+  if (records.length === 0) return
+  if (env.EVENTS_PIPELINE) {
+    try { await env.EVENTS_PIPELINE.send(records) }
+    catch (err) { console.error('[emit] Pipeline send failed:', err) }
+  }
+  if (env.EVENTS) {
+    try { await env.EVENTS.ingest(records) }
+    catch (err) { console.error('[emit] BufferDO ingest failed:', err) }
+  }
+}
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -129,7 +144,7 @@ export class PayloadDatabaseDO extends DB {
   }
 
   /**
-   * Forward event to the Pipeline binding for CDC.
+   * Forward event to Pipeline (durable) + BufferDO (real-time CH).
    * Validates ULID format before sending.
    */
   sendEvent(event: Record<string, unknown>): void {
@@ -138,9 +153,10 @@ export class PayloadDatabaseDO extends DB {
       console.error(`[cdc] Rejecting event with invalid ULID id: ${id}`)
       return
     }
-    if ((this.env as any).EVENTS_PIPELINE) {
-      ;(this.env as any).EVENTS_PIPELINE.send([event])
-    }
+    emitRawRecords(
+      { EVENTS_PIPELINE: (this.env as any).EVENTS_PIPELINE, EVENTS: (this.env as any).EVENTS },
+      [event],
+    ).catch((err) => console.error('[cdc] emit failed:', err))
   }
 
   /**
