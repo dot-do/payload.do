@@ -14,5 +14,9 @@
   ],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["PayloadDatabaseDO"] }
+  ],
+  "tail_consumers": [
+    { "service": "tail" },
+    { "service": "otel" }
   ]
 }
