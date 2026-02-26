@@ -191,17 +191,20 @@ function buildCHConditions(where: Where, params: Record<string, string | number>
   return { sql: parts.join(' AND '), paramIdx }
 }
 
+// events_v2 schema has no `ts` column — derive from ULID (monotonic over ORDER BY key, so CH can optimize range scans)
+const TS_EXPR = 'ULIDStringToDateTime(id)'
+
 const CH_COLUMN_MAP: Record<string, string> = {
   id: 'id',
   ns: 'ns',
-  ts: 'ts',
+  ts: TS_EXPR,
   type: 'type',
   event: 'event',
   source: 'source',
   data: 'data',
-  createdAt: 'ts',
-  updatedAt: 'ts',
-  timestamp: 'ts',
+  createdAt: TS_EXPR,
+  updatedAt: TS_EXPR,
+  timestamp: TS_EXPR,
   name: 'event',
   url: 'url',
   actor: 'actor',
@@ -297,13 +300,13 @@ function buildCHFieldConditions(
 }
 
 /** Lightweight columns for list views — avoids reading heavy JSON blobs. */
-const CH_LIST_COLUMNS = 'id, ray, ns, ts, type, event, source, url, file, ingested'
+const CH_LIST_COLUMNS = `id, ray, ns, ${TS_EXPR} as ts, type, event, source, url, file, ingested`
 
 /**
  * Default time window (24h) applied when no explicit ts/createdAt filter is present.
  * Prevents OOM on ClickHouse Cloud when the events table has 100M+ rows in a single partition.
  */
-const DEFAULT_TIME_WINDOW = 'ts > now() - INTERVAL 24 HOUR'
+const DEFAULT_TIME_WINDOW = `${TS_EXPR} > now() - INTERVAL 24 HOUR`
 
 /** Check if a Payload where clause contains a time-based filter (ts or createdAt). */
 function hasTimeFilter(where: Where | undefined): boolean {
@@ -371,7 +374,7 @@ export async function chFindOne(service: PayloadDatabaseService, collection: str
     }
     const { sql: whereSql, params } = buildCHWhere(where, context, skipNs, baseFilter)
 
-    const result = await service.chQuery(`SELECT * FROM ${table} WHERE ${whereSql} LIMIT 1`, params)
+    const result = await service.chQuery(`SELECT *, ${TS_EXPR} as ts FROM ${table} WHERE ${whereSql} LIMIT 1`, params)
     if (result.data.length === 0) return null
     return chRowToDocument(result.data[0], collection)
   } catch (err) {
@@ -407,16 +410,15 @@ export function buildCHOrderClause(sort: string | string[] | undefined): string 
     const dir = sortStr.startsWith('-') ? 'DESC' : 'ASC'
     const field = sortStr.replace(/^-/, '')
     let col = chColumn(field)
-    // Remap id sorts to ts: ORDER BY id OOMs on large tables (273M+ rows, 1,463 parts).
-    // Since IDs are ULIDs (time-sorted), ts gives equivalent chronological ordering
-    // and uses ClickHouse's streaming top-N optimization that fits in memory.
-    if (col === 'id') col = 'ts'
+    // Remap ts sorts to id: id is the table's ORDER BY key (ULID, time-sorted)
+    // so ORDER BY id uses the primary index (9ms) vs ORDER BY ts full-scans (734ms on 50M rows).
+    if (col === 'ts') col = 'id'
     if (col) {
       parts.push(`${col} ${dir}`)
     }
   }
 
-  if (parts.length === 0) return 'ORDER BY ts DESC'
+  if (parts.length === 0) return 'ORDER BY id DESC'
   return `ORDER BY ${parts.join(', ')}`
 }
 

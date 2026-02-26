@@ -443,7 +443,7 @@ export default {
         readUrl.searchParams.set('database', 'platform')
         readUrl.searchParams.set('default_format', 'JSON')
 
-        const readSql = `SELECT id, ts, event, data FROM events WHERE ns = '${testNs}' AND event = '${testType}.versioned' AND id = '${versionEvent.id}' LIMIT 1`
+        const readSql = `SELECT id, ULIDStringToDateTime(id) as ts, event, data FROM events WHERE ns = '${testNs}' AND event = '${testType}.versioned' AND id = '${versionEvent.id}' LIMIT 1`
         readUrl.searchParams.set('query', readSql)
 
         const readResp = await fetch(readUrl.toString(), {
