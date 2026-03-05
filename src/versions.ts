@@ -44,7 +44,7 @@ export class ClickHouseVersionStore implements VersionStore {
     // Use id (ULID, time-sorted) for ordering — it's the table's ORDER BY key (9ms vs 734ms for ts)
     const dir = sort?.startsWith?.('-') ? 'DESC' : 'ASC'
 
-    let sql = `SELECT id, ULIDStringToDateTime(id) as ts, data FROM events WHERE ns = {ctx:String} AND event = {evt:String}`
+    let sql = `SELECT id, ULIDStringToDateTime(id) as ts, data FROM events FINAL WHERE ns = {ctx:String} AND event = {evt:String}`
     const params: Record<string, string | number> = { ctx: context, evt: `${type}.versioned` }
 
     if (id) {
@@ -73,7 +73,7 @@ export class ClickHouseVersionStore implements VersionStore {
       })
 
       // Get total count
-      let countSql = `SELECT count() as total FROM events WHERE ns = {ctx:String} AND event = {evt:String}`
+      let countSql = `SELECT count() as total FROM events FINAL WHERE ns = {ctx:String} AND event = {evt:String}`
       if (id) countSql += ` AND data.id.:String = {parentId:String}`
       const countResult = (await this.service.chQuery(countSql, params)) as { data: { total: number }[] }
       const totalDocs = countResult.data[0]?.total ?? 0
@@ -87,7 +87,7 @@ export class ClickHouseVersionStore implements VersionStore {
 
   async countVersions(args: { context: string; type: string; id?: string }) {
     const { context, type, id } = args
-    let sql = `SELECT count() as total FROM events WHERE ns = {ctx:String} AND event = {evt:String}`
+    let sql = `SELECT count() as total FROM events FINAL WHERE ns = {ctx:String} AND event = {evt:String}`
     const params: Record<string, string | number> = { ctx: context, evt: `${type}.versioned` }
     if (id) {
       sql += ` AND data.id.:String = {parentId:String}`
